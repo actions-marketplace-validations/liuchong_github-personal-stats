@@ -20,6 +20,7 @@
 - `.agents/knowledge/deployment.md`: CLI, Action, server, release, and hosting notes.
 - `.agents/knowledge/compatibility.md`: compatibility concepts and parameter mapping notes.
 - `.agents/knowledge/activity-sources.md`: where local coding activity can be read from, and in what order to prefer.
+- `.agents/knowledge/collector-plan.md`: the implementation plan for more local sources, a smaller daemon, and a native Apple Silicon build.
 
 ## Intake
 

@@ -433,3 +433,14 @@ rather than approximate. Default stays `sans`.
 What cannot be lined up: a stat row leads with a 16px icon, so its label starts
 at 38 inside the card against the chart's 16. Removing the icons to gain that is
 not worth it, and the card titles do line up.
+
+## [2026-09-29] collector | plan the next local sources and a smaller daemon
+
+The installed daemon is an x86_64 binary that collects inside its own process.
+After twenty-five days idle it was still about 580 MB resident, because the
+allocator keeps the scan's high-water mark. AD-0008 records the decision: the
+scan becomes a child process that exits, resume positions stay in the state
+directory, and the binaries for this machine are aarch64. The reader order is
+in `.agents/knowledge/collector-plan.md`. No product code changed, and the
+running daemon was left in place so a restart would not begin another
+in-process scan.

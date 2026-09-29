@@ -99,3 +99,17 @@ Decision: Separate reading a profile from drawing it. `fetch` reads once and sav
 Consequences: A set of tiles costs one read, whatever the number of cards, themes, and widths, and the render steps need no token because they reach nothing. Drawing a panel at two widths is now a render rather than a fetch, which is what makes AD-0006's correction practical. The writer had to be correct rather than convenient: the existing reader finds a field by the first matching key and understood no escapes, so `name` has to be written before the languages that carry a name of their own, and both sides now handle escapes — a display name with a quote in it is real data, not a hypothetical. The refusal is a behaviour change for a combination that never did anything, and the action's `config`, `target-branch`, `committer`, and `author` inputs went with it: they described a config file and a commit step this action does not have.
 
 Review Date: 2026-11-24
+
+## AD-0008: The Daemon Must Not Be The Process That Scans
+
+Date: 2026-09-29
+
+Status: Accepted
+
+Context: The installed daemon is an x86_64 binary on an Apple Silicon machine, and it calls collection on a timer inside its own process. One collection walks every terminal transcript it knows. The system allocator does not hand those pages back, so the resident size stays at whatever the largest scan needed for as long as the process lives. Measured on the running installation: about 580 MB resident and no CPU, after the process had been up for twenty-five days. The virtual size was tens of gigabytes. Rebuilding that binary for the machine's own architecture removes the translation, and it does not shrink a high-water mark the process is still going to reach on the next scan.
+
+Decision: The scheduled scan runs as `github-personal-stats-collect` and that process exits. The daemon keeps the panel, the pulse listener, and the timer. Ship both binaries for `aarch64-apple-darwin` on this machine. Resume positions for large stores live in the state directory, so a scan reads what changed. New sources join the same collect process and the same one timeline; they do not get a second way of counting an hour or a token.
+
+Consequences: Replacing the running daemon waits until the child scan exists, because the timer collects once at start and a fresh in-process scan would climb straight back to the same resident size. A missing source directory stays a non-event. Tokens are still summed per source, so a launcher's copy of a tool the collector already reads is not a source.
+
+Review Date: 2026-12-29

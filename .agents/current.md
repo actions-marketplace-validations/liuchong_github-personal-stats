@@ -2,19 +2,19 @@
 
 ## Date
 
-2026-08-24
+2026-09-29
 
 ## Project State
 
-The planned foundation, data client, aggregation, renderer, CLI, Action, server, and deployment stages have been implemented and committed.
+The renderer, the collector, and the daemon are in use on this machine. The installed binaries are x86_64. The daemon has been up for weeks and is holding the high-water mark of an in-process scan.
 
 ## Active Task
 
-Run final verification and continue hardening production behavior through focused follow-up tasks. The heat ring is fully configurable and themes are selectable from the CLI, with the ramp resolving against the theme; both are documented with illustrations in the user guide. The crates carry the metadata crates.io requires and the manifest version now tracks the release tags. Panel content is configurable too: `--stat-rows`, `--language-rows`, and `--streak-sides` choose what each panel reports, and `GithubStatsConfig` is now `#[non_exhaustive]` so later options ship as minor releases. A README can also compose its own layout out of tiles: `heat` and `metric` cards draw the ring or a single figure alone, `--height auto` fits a card to its content, and `--padding` and `--scale` keep a composed row aligned and legible on a phone. Composing many tiles no longer means fetching many times: `fetch` reads a profile once into the shape `--fixture` reads, and every card, theme, and width is drawn from that one read.
+Follow `.agents/knowledge/collector-plan.md`. First slice: build the collector and the daemon for aarch64-apple-darwin, and move the scheduled scan into a child process that exits, before replacing the running daemon. Do not publish, and do not change the version.
 
 ## Next Safe Task After Commit
 
-Replace deterministic sample data paths with real authenticated upstream fetching, caching, and production release publishing.
+Add the readers in the order that plan names, each with fixtures, and keep external tools on their own stores.
 
 ## Constraints
 

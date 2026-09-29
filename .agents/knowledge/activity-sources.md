@@ -93,6 +93,26 @@ happen at the point of capture:
 - Codex spills hook output over roughly 2,500 tokens to a temporary file, so a
   hook's stdout should stay empty.
 
+## What the next readers are
+
+Decided 2026-09-29, after reading the stores on the same machine. The
+implementation order and the memory constraint are in `collector-plan.md`.
+
+- Pi sessions are JSONL with per-message usage. OpenCode keeps cumulative token
+  columns on a session row in its own database; record the delta, not the total
+  again. che writes JSONL whose usage sits in a state snapshot after the
+  message body, so a line over the current limit still has to yield a timestamp
+  and the two provider counts, deduped by revision.
+- DeepSeek Harness is its own reader. Its JSONL plugin has no default root. On
+  this machine the transcripts sit where a launcher pointed that root, under
+  the launcher's state directory, and `~/.dsh` itself held no sessions.
+- A control-plane launcher is not a second copy of the tools it starts. Read
+  the external tool's own store. Read the launcher's journal only for the
+  agent whose runtime is the launcher itself, and only the usage events that
+  name that agent.
+- One local reviewer runs a task in the current checkout and keeps no ledger.
+  There is nothing to collect until it writes one.
+
 ## Not verified
 
 - Where Kimi Code CLI writes per-turn message content. The session directory
