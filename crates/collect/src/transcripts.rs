@@ -24,18 +24,21 @@
 //! would mean reading the one thing this promised not to.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use github_personal_stats_core::{Author, DayBucket, TokenUsage, UNKNOWN_LANGUAGE};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::{
     clock::LocalCalendar,
     error::CollectError,
+    resume::{self, Captured, Moment, TokenRow},
     sessions::{Event, Part},
 };
 
@@ -69,11 +72,12 @@ pub fn claude_path(home: &Path) -> PathBuf {
 /// and a machine that only ever ran one of them should not have to say so.
 pub fn read(
     home: &Path,
+    state_dir: &Path,
     days: &mut BTreeMap<String, DayBucket>,
 ) -> Result<Vec<Event>, CollectError> {
     let mut calendar = LocalCalendar::new()?;
     let mut moments = Vec::new();
-    read_codex(&codex_path(home), &mut calendar, days, &mut moments)?;
+    read_codex(home, state_dir, &mut calendar, days, &mut moments)?;
     read_claude(&claude_path(home), &mut calendar, days, &mut moments)?;
     moments.sort_by_key(|moment| moment.second);
     Ok(moments)
@@ -110,57 +114,334 @@ fn observed(
 /// runs past midnight spends on both days and only the per-request figure can say
 /// how much on each.
 fn read_codex(
-    root: &Path,
+    home: &Path,
+    state_dir: &Path,
     calendar: &mut LocalCalendar,
     days: &mut BTreeMap<String, DayBucket>,
     moments: &mut Vec<Event>,
 ) -> Result<(), CollectError> {
-    for path in transcripts(root)? {
-        let mut model = String::new();
-        for line in lines(&path)? {
-            // Every timestamped line says the session was live then, which is
-            // what a moment is; only some of them say what it cost. The cheap
-            // test comes first so that the great majority of lines are neither
-            // parsed nor held.
-            let Some(stamp) = stamp_in(&line) else {
-                continue;
-            };
-            observed(calendar, &stamp, &model, moments)?;
+    if let Some(index) = codex_index(home) {
+        return match thread_index(&index) {
+            Ok(threads) => replay_codex(&threads, state_dir, calendar, days, moments),
+            Err(IndexFailure::Busy) => replay_stored(state_dir, days, moments),
+            Err(IndexFailure::Schema(message)) => Err(CollectError::UnexpectedSchema {
+                source: "terminal session index",
+                message,
+            }),
+            Err(IndexFailure::Unreadable(message)) => Err(CollectError::Unreadable {
+                path: index,
+                message,
+            }),
+        };
+    }
+    for path in transcripts(&codex_path(home))? {
+        accept_file(&path, calendar, days, moments)?;
+    }
+    Ok(())
+}
 
-            if !line.contains("\"token_count\"") && !line.contains("\"turn_context\"") {
-                continue;
-            }
-            let Ok(event) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            let payload = &event["payload"];
-
-            if event["type"] == "turn_context" {
-                if let Some(named) = payload["model"].as_str() {
-                    model = named.to_owned();
+/// Sessions the index names, folded in whole.
+///
+/// A day published from only the sessions that moved would be a partial day, and
+/// the larger reading already on disk would hide the new tokens. Each file's
+/// contribution is remembered, the ones that moved are read again, and every
+/// contribution is folded back in.
+fn replay_codex(
+    threads: &[(String, i64)],
+    state_dir: &Path,
+    calendar: &mut LocalCalendar,
+    days: &mut BTreeMap<String, DayBucket>,
+    moments: &mut Vec<Event>,
+) -> Result<(), CollectError> {
+    let mut kept = HashSet::new();
+    for (path, updated_at_ms) in threads {
+        if path.is_empty() {
+            continue;
+        }
+        kept.insert(resume::file_id(path));
+        let captured = match resume::load(state_dir, path) {
+            Some(stored) if stored.updated_at_ms == *updated_at_ms => stored,
+            _ => match capture_file(path, *updated_at_ms, calendar) {
+                Ok(fresh) => {
+                    resume::store(state_dir, &fresh)?;
+                    fresh
                 }
-            }
-            if payload["type"] != "token_count" {
-                continue;
-            }
-            let Some(stamp) = event["timestamp"].as_str() else {
-                continue;
-            };
-            let spent = &payload["info"]["last_token_usage"];
-            // Codex counts cached input inside its input figure, and reasoning
-            // inside its output. The record keeps the cache apart, since tokens a
-            // cache served were not paid for at the same rate.
-            let input = number(&spent["input_tokens"]);
-            let cached = number(&spent["cached_input_tokens"]);
-            let usage = TokenUsage {
-                input: input.saturating_sub(cached),
-                output: number(&spent["output_tokens"]),
-                cached,
-            };
-            spend(days, calendar, stamp, &model, usage)?;
+                Err(CollectError::NotFound { .. }) => match resume::load(state_dir, path) {
+                    Some(stored) => stored,
+                    None => continue,
+                },
+                Err(error) => return Err(error),
+            },
+        };
+        apply_captured(&captured, days, moments);
+    }
+    resume::retain(state_dir, &kept)
+}
+
+fn replay_stored(
+    state_dir: &Path,
+    days: &mut BTreeMap<String, DayBucket>,
+    moments: &mut Vec<Event>,
+) -> Result<(), CollectError> {
+    let directory = resume::directory(state_dir);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CollectError::Unreadable {
+                path: directory,
+                message: error.to_string(),
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| CollectError::Unreadable {
+            path: directory.clone(),
+            message: error.to_string(),
+        })?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".bin"))
+        {
+            continue;
+        }
+        if let Some(captured) = resume::read_stored(&entry.path()) {
+            apply_captured(&captured, days, moments);
         }
     }
     Ok(())
+}
+
+fn apply_captured(
+    captured: &Captured,
+    days: &mut BTreeMap<String, DayBucket>,
+    moments: &mut Vec<Event>,
+) {
+    for moment in &captured.moments {
+        moments.push(Event {
+            second: moment.second,
+            day: moment.day.clone(),
+            languages: vec![
+                Part::new(UNKNOWN_LANGUAGE, Some(Author::Agent), 1).by(moment.model.clone()),
+            ],
+        });
+    }
+    for row in &captured.tokens {
+        let held = days
+            .entry(row.day.clone())
+            .or_insert_with(|| DayBucket::new(&row.day))
+            .tokens
+            .entry(row.model.clone())
+            .or_default();
+        held.input += row.usage.input;
+        held.output += row.usage.output;
+        held.cached += row.usage.cached;
+    }
+}
+
+fn accept_file(
+    path: &Path,
+    calendar: &mut LocalCalendar,
+    days: &mut BTreeMap<String, DayBucket>,
+    moments: &mut Vec<Event>,
+) -> Result<(), CollectError> {
+    let mut model = String::new();
+    for line in lines(path)? {
+        accept_line(&line, &mut model, calendar, days, moments)?;
+    }
+    Ok(())
+}
+
+fn capture_file(
+    path: &str,
+    updated_at_ms: i64,
+    calendar: &mut LocalCalendar,
+) -> Result<Captured, CollectError> {
+    let file = Path::new(path);
+    if !file.is_file() {
+        return Err(CollectError::NotFound {
+            what: "session transcript",
+            path: file.to_path_buf(),
+        });
+    }
+    let mut model = String::new();
+    let mut days = BTreeMap::new();
+    let mut moments = Vec::new();
+    for line in lines(file)? {
+        accept_line(&line, &mut model, calendar, &mut days, &mut moments)?;
+        collapse_same_second(&mut moments);
+    }
+    let mut tokens = Vec::new();
+    for (day, bucket) in days {
+        for (model, usage) in bucket.tokens {
+            if usage.total() == 0 {
+                continue;
+            }
+            tokens.push(TokenRow {
+                day: day.clone(),
+                model,
+                usage,
+            });
+        }
+    }
+    Ok(Captured {
+        updated_at_ms,
+        path: path.to_owned(),
+        moments: moments
+            .into_iter()
+            .map(|event| Moment {
+                second: event.second,
+                day: event.day,
+                model: event
+                    .languages
+                    .into_iter()
+                    .next()
+                    .map(|part| part.model)
+                    .unwrap_or_default(),
+            })
+            .collect(),
+        tokens,
+    })
+}
+
+fn collapse_same_second(moments: &mut Vec<Event>) {
+    let Some(latest) = moments.last() else {
+        return;
+    };
+    let Some(earlier) = moments.get(moments.len().saturating_sub(2)) else {
+        return;
+    };
+    let same_second = latest.second == earlier.second;
+    let same_model = latest.languages.first().map(|part| part.model.as_str())
+        == earlier.languages.first().map(|part| part.model.as_str());
+    if same_second && same_model {
+        moments.pop();
+    }
+}
+
+fn accept_line(
+    line: &str,
+    model: &mut String,
+    calendar: &mut LocalCalendar,
+    days: &mut BTreeMap<String, DayBucket>,
+    moments: &mut Vec<Event>,
+) -> Result<(), CollectError> {
+    // Every timestamped line says the session was live then, which is what a
+    // moment is; only some of them say what it cost. The cheap test comes first
+    // so that the great majority of lines are neither parsed nor held.
+    let Some(stamp) = stamp_in(line) else {
+        return Ok(());
+    };
+    observed(calendar, &stamp, model, moments)?;
+
+    if !line.contains("\"token_count\"") && !line.contains("\"turn_context\"") {
+        return Ok(());
+    }
+    let Ok(event) = serde_json::from_str::<Value>(line) else {
+        return Ok(());
+    };
+    let payload = &event["payload"];
+
+    if event["type"] == "turn_context" {
+        if let Some(named) = payload["model"].as_str() {
+            *model = named.to_owned();
+        }
+    }
+    if payload["type"] != "token_count" {
+        return Ok(());
+    }
+    let Some(stamp) = event["timestamp"].as_str() else {
+        return Ok(());
+    };
+    let spent = &payload["info"]["last_token_usage"];
+    // Codex counts cached input inside its input figure, and reasoning inside
+    // its output. The record keeps the cache apart, since tokens a cache served
+    // were not paid for at the same rate.
+    let input = number(&spent["input_tokens"]);
+    let cached = number(&spent["cached_input_tokens"]);
+    let usage = TokenUsage {
+        input: input.saturating_sub(cached),
+        output: number(&spent["output_tokens"]),
+        cached,
+    };
+    spend(days, calendar, stamp, model, usage)
+}
+
+const INDEX_WAIT: Duration = Duration::from_secs(30);
+
+enum IndexFailure {
+    Busy,
+    Schema(String),
+    Unreadable(String),
+}
+
+/// The newest `state_<n>.sqlite` beside the session tree. The number in the
+/// name is a schema generation, so it is discovered rather than hard-coded.
+fn codex_index(home: &Path) -> Option<PathBuf> {
+    let directory = home.join(".codex");
+    let mut best: Option<(u32, PathBuf)> = None;
+    let entries = fs::read_dir(&directory).ok()?;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(generation) = name
+            .strip_prefix("state_")
+            .and_then(|rest| rest.strip_suffix(".sqlite"))
+            .and_then(|generation| generation.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(held, _)| generation > *held) {
+            best = Some((generation, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn thread_index(path: &Path) -> Result<Vec<(String, i64)>, IndexFailure> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(classify_index)?;
+    connection
+        .busy_timeout(INDEX_WAIT)
+        .map_err(classify_index)?;
+    let mut statement = connection
+        .prepare("SELECT rollout_path, updated_at_ms FROM threads")
+        .map_err(classify_index)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(classify_index)?;
+    let mut threads = Vec::new();
+    for row in rows {
+        threads.push(row.map_err(classify_index)?);
+    }
+    Ok(threads)
+}
+
+fn classify_index(error: rusqlite::Error) -> IndexFailure {
+    if let rusqlite::Error::SqliteFailure(failure, _) = &error {
+        if matches!(
+            failure.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+        ) {
+            return IndexFailure::Busy;
+        }
+        let message = error.to_string();
+        if message.contains("no such") {
+            return IndexFailure::Schema(message);
+        }
+    }
+    IndexFailure::Unreadable(error.to_string())
 }
 
 /// Claude Code reports usage on each message it receives, which is already the
@@ -382,5 +663,121 @@ fn read_bounded(reader: &mut impl BufRead, into: &mut String) -> Option<bool> {
         if done.is_some() {
             return Some(!overran);
         }
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    fn scratch() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "gps-codex-index-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn write_session(path: &Path, input: u64) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = format!(
+            "{{\"timestamp\":\"2026-08-20T04:00:00.000Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt\"}}}}\n\
+             {{\"timestamp\":\"2026-08-20T04:00:01.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":0,\"output_tokens\":1}},\"total_token_usage\":{{\"input_tokens\":0,\"cached_input_tokens\":0,\"output_tokens\":0}}}}}}}}\n"
+        );
+        fs::write(path, body).unwrap();
+    }
+
+    fn index(home: &Path, rows: &[(&Path, i64)]) {
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let path = home.join(".codex").join("state_1.sqlite");
+        let _ = fs::remove_file(&path);
+        let database = Connection::open(path).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE threads (rollout_path TEXT NOT NULL, updated_at_ms INTEGER NOT NULL);",
+            )
+            .unwrap();
+        for (path, updated) in rows {
+            database
+                .execute(
+                    "INSERT INTO threads (rollout_path, updated_at_ms) VALUES (?1, ?2)",
+                    (path.display().to_string(), updated),
+                )
+                .unwrap();
+        }
+    }
+
+    fn input_tokens(home: &Path) -> u64 {
+        let mut days = BTreeMap::new();
+        read(home, &home.join("state"), &mut days).expect("index should be readable");
+        days.values()
+            .flat_map(|day| day.tokens.values())
+            .map(|usage| usage.input)
+            .sum()
+    }
+
+    #[test]
+    fn the_index_names_which_files_count_and_an_unchanged_one_is_not_reread() {
+        let home = scratch();
+        let kept = home.join("kept.jsonl");
+        let changed = home.join("changed.jsonl");
+        let ignored = home.join("ignored.jsonl");
+        write_session(&kept, 10);
+        write_session(&changed, 20);
+        write_session(&ignored, 100);
+        index(&home, &[(&kept, 1), (&changed, 1)]);
+
+        assert_eq!(input_tokens(&home), 30);
+
+        fs::remove_file(&kept).unwrap();
+        write_session(&changed, 7);
+        assert_eq!(
+            input_tokens(&home),
+            30,
+            "an unchanged stamp must be served from the resume, even if the file is gone or rewritten"
+        );
+
+        index(&home, &[(&kept, 1), (&changed, 2)]);
+        assert_eq!(input_tokens(&home), 17);
+    }
+
+    #[test]
+    fn a_session_the_index_forgets_stops_contributing() {
+        let home = scratch();
+        let first = home.join("first.jsonl");
+        let second = home.join("second.jsonl");
+        write_session(&first, 4);
+        write_session(&second, 6);
+        index(&home, &[(&first, 1), (&second, 1)]);
+        assert_eq!(input_tokens(&home), 10);
+
+        index(&home, &[(&first, 1)]);
+        assert_eq!(input_tokens(&home), 4);
+    }
+
+    #[test]
+    fn an_index_without_the_expected_table_is_not_silently_walked() {
+        let home = scratch();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        Connection::open(home.join(".codex").join("state_9.sqlite"))
+            .unwrap()
+            .execute_batch("CREATE TABLE other (id INTEGER);")
+            .unwrap();
+        write_session(&home.join(".codex/sessions/one.jsonl"), 50);
+
+        let mut days = BTreeMap::new();
+        let error = match read(&home, &home.join("state"), &mut days) {
+            Err(error) => error,
+            Ok(_) => panic!("a schema the collector does not know should fail the run"),
+        };
+        assert!(
+            matches!(error, CollectError::UnexpectedSchema { .. }),
+            "{error}"
+        );
+        assert!(days.is_empty());
     }
 }

@@ -6,15 +6,15 @@
 
 ## Project State
 
-The renderer, the collector, and the daemon are in use on this machine. The installed binaries are x86_64. The daemon has been up for weeks and is holding the high-water mark of an in-process scan.
+Scheduled collection runs the collector as its own process, and that process exits. The terminal session index decides which session files are opened; a session that has not moved is replayed from the state directory. The panel reads the published record. The binaries for this machine are built for aarch64.
 
 ## Active Task
 
-Follow `.agents/knowledge/collector-plan.md`. First slice: build the collector and the daemon for aarch64-apple-darwin, and move the scheduled scan into a child process that exits, before replacing the running daemon. Do not publish, and do not change the version.
+Add the readers named in `.agents/knowledge/collector-plan.md`, in that order, each with fixtures. Pi is first. Do not publish, and do not change the version.
 
 ## Next Safe Task After Commit
 
-Add the readers in the order that plan names, each with fixtures, and keep external tools on their own stores.
+OpenCode's session table, recording the growth of its cumulative token columns rather than the totals again.
 
 ## Constraints
 

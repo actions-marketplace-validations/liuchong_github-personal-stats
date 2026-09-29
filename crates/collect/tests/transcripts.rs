@@ -42,7 +42,8 @@ fn codex_event(stamp: &str, input: u64, cached: u64, output: u64) -> String {
 
 fn read(home: &Path) -> BTreeMap<String, DayBucket> {
     let mut days = BTreeMap::new();
-    transcripts::read(home, &mut days).expect("a readable record should be read");
+    transcripts::read(home, &home.join("state"), &mut days)
+        .expect("a readable record should be read");
     days
 }
 

@@ -8,6 +8,7 @@ pub mod presence;
 pub mod pulse;
 pub mod random;
 pub mod records;
+mod resume;
 pub mod sessions;
 pub mod sink;
 pub mod transcripts;
@@ -48,7 +49,11 @@ pub fn collect(settings: &Settings) -> Result<ActivitySnapshot, CollectError> {
     // Terminal agents keep their own records: tokens nothing else can see, and
     // timestamps for work that never passes through an editor.
     let mut moments = editor.moments;
-    moments.extend(transcripts::read(&settings.home, &mut days)?);
+    moments.extend(transcripts::read(
+        &settings.home,
+        &settings.state_dir,
+        &mut days,
+    )?);
 
     // One timeline, not one per source. An afternoon in which an agent ran in the
     // editor and another in a terminal is one afternoon, and the only way to say

@@ -3,6 +3,9 @@
 Decided 2026-09-29. This is the work list for the local collector and the
 daemon. It does not change the version and it does not publish anything.
 
+The scheduled scan is a child process, and the terminal session index decides
+which session files are opened. What remains is the readers below.
+
 ## What is installed now
 
 The three binaries in `~/.local/bin` are Mach-O x86_64. The machine is arm64,

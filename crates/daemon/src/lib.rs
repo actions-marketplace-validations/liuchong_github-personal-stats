@@ -6,16 +6,18 @@ pub mod token;
 
 use std::{
     net::{IpAddr, SocketAddr, TcpListener},
+    path::PathBuf,
+    process::{Command, Stdio},
     sync::Mutex,
 };
 
 use github_personal_stats_collect::{
-    CollectError, Settings, collect, presence,
+    CollectError, Settings, clock, machine, presence,
     pulse::{self, PulseBatch},
-    records::{self, Recount},
+    records,
     sink::Sink,
 };
-use github_personal_stats_core::{ActivitySnapshot, store::keep_fuller_days, summarise_activity};
+use github_personal_stats_core::{ActivitySnapshot, summarise_activity};
 
 use crate::http::{Request, Response, quote, read_request, write_response};
 
@@ -31,6 +33,12 @@ pub struct Daemon {
     /// Held while a snapshot is being rebuilt, so the timer and a request asking
     /// for the same work cannot write the file at once.
     writing: Mutex<()>,
+    /// The collector binary. A scan's pages stay with that process, which exits,
+    /// so this one does not keep them for the rest of its life.
+    collector: PathBuf,
+    /// Sink flags the command line set. The child reads the same state
+    /// configuration this process did; these are only the overrides.
+    collect_args: Vec<String>,
 }
 
 impl Daemon {
@@ -38,12 +46,23 @@ impl Daemon {
         settings: Settings,
         sink: Box<dyn Sink + Send + Sync>,
     ) -> Result<Self, CollectError> {
+        Self::with_collector(settings, sink, collector_program(), Vec::new())
+    }
+
+    pub fn with_collector(
+        settings: Settings,
+        sink: Box<dyn Sink + Send + Sync>,
+        collector: PathBuf,
+        collect_args: Vec<String>,
+    ) -> Result<Self, CollectError> {
         let token = token::read_or_mint(&settings.state_dir)?;
         Ok(Self {
             settings,
             token,
             sink,
             writing: Mutex::new(()),
+            collector,
+            collect_args,
         })
     }
 
@@ -115,18 +134,15 @@ impl Daemon {
         work(self)
     }
 
-    /// The record as it stands, which is what anyone asking wants to see.
-    ///
-    /// A fresh reading alone would be wrong here: it reaches back only as far as
-    /// the sources do, so a panel built from one would show a month and call it
-    /// everything. The published record holds the whole history, and the fresh
-    /// reading holds today's hours, which are not published yet. So both, merged
-    /// the same way publishing merges them — but written nowhere, because this is
-    /// a question, not a collection.
+    /// The published record. A fresh scan is a separate process, started by the
+    /// timer or by `POST /v1/collect`, and the page shows what that process last
+    /// wrote. Scanning inside this process would leave its high-water mark here
+    /// until the daemon exited.
     fn record(&self) -> Result<ActivitySnapshot, CollectError> {
-        let mut snapshot = collect(&self.settings)?;
-        let published = records::read_days(&self.sink.root(), &snapshot.machine)?;
-        snapshot.days = keep_fuller_days(&published, &snapshot.days);
+        let machine = machine::identity(&self.settings.state_dir)?;
+        let days = records::read_days(&self.sink.root(), &machine)?;
+        let mut snapshot = ActivitySnapshot::new(machine, clock::utc_timestamp(clock::now()));
+        snapshot.days = days;
         Ok(snapshot)
     }
 
@@ -197,29 +213,51 @@ impl Daemon {
 
     fn rebuild(&self) -> Response {
         let _held = self.writing.lock().unwrap_or_else(|poisoned| {
-            // A panic while writing leaves the file either old or new, never
-            // half-written, because saving replaces it in one call.
+            // A panic while waiting on the child leaves the record either old or
+            // new. The child publishes by replacing files, and this process does
+            // not write them.
             poisoned.into_inner()
         });
-        let snapshot = match collect(&self.settings) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Response::problem(500, &error.to_string()),
-        };
-        // Always the keeping rule here. A daemon on a timer must not quietly
-        // correct a day downwards; recounting is a deliberate act, asked for by
-        // hand on the collector when the way time is counted has changed.
-        let written = match self.sink.publish(&snapshot, Recount::KeepFuller) {
-            Ok(path) => path,
-            Err(error) => return Response::problem(500, &error.to_string()),
-        };
-        Response::json(
-            200,
-            format!(
-                "{{\"days\":{},\"snapshot\":{}}}\n",
-                snapshot.days.len(),
-                quote(&written.display().to_string())
+        match self.run_collector() {
+            Ok(report) => Response::json(
+                200,
+                format!(
+                    "{{\"days\":{},\"snapshot\":{}}}\n",
+                    report.days,
+                    quote(&report.snapshot)
+                ),
             ),
-        )
+            Err(error) => Response::problem(500, &error),
+        }
+    }
+
+    fn run_collector(&self) -> Result<CollectedReport, String> {
+        let output = Command::new(&self.collector)
+            .arg("--state")
+            .arg(&self.settings.state_dir)
+            .arg("--home")
+            .arg(&self.settings.home)
+            .arg("--output")
+            .arg(&self.settings.snapshot)
+            .arg("--idle-timeout")
+            .arg((self.settings.idle_timeout_seconds / 60).to_string())
+            .args(&self.collect_args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("could not run {}: {error}", self.collector.display()))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            let detail = detail.trim();
+            let detail = if detail.len() > 400 {
+                &detail[..400]
+            } else {
+                detail
+            };
+            return Err(format!("collector exited {}: {detail}", output.status));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        collected_report(&stdout)
+            .ok_or_else(|| "collector finished without saying where the record went".to_owned())
     }
 
     fn summary(&self) -> Response {
@@ -261,6 +299,59 @@ impl Daemon {
             std::thread::sleep(std::time::Duration::from_secs(minutes * 60));
         }
     }
+}
+
+struct CollectedReport {
+    days: usize,
+    snapshot: String,
+}
+
+/// The collector's first line is the only machine-readable thing it prints:
+/// `N days recorded as <machine> through <path>`.
+fn collected_report(stdout: &str) -> Option<CollectedReport> {
+    let line = stdout.lines().next()?;
+    let (days, rest) = line.split_once(" days recorded as ")?;
+    let days = days.parse().ok()?;
+    let snapshot = rest.split_once(" through ")?.1.to_owned();
+    Some(CollectedReport { days, snapshot })
+}
+
+/// Where the collector binary should be. Beside this executable when it was
+/// installed that way, and on `PATH` otherwise.
+pub fn collector_program() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|dir| dir.join("github-personal-stats-collect"))
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("github-personal-stats-collect"))
+}
+
+/// Sink flags to repeat for the child. It reads the state configuration itself;
+/// a flag here is one the command line set, which has to beat that file the
+/// same way it did for this process. Recount is never forwarded: a timer must
+/// not quietly replace a day.
+pub fn collector_overrides(args: &[String]) -> Vec<String> {
+    let mut overrides = Vec::new();
+    for name in ["--sink", "--repo", "--origin", "--branch"] {
+        if let Some(value) = flag_value(args, name) {
+            overrides.push(name.to_owned());
+            overrides.push(value);
+        }
+    }
+    if args.iter().any(|arg| arg == "--no-push") {
+        overrides.push("--no-push".to_owned());
+    }
+    overrides
+}
+
+fn flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
 }
 
 fn split_query(path: &str) -> (&str, &str) {

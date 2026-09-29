@@ -90,11 +90,12 @@ fn a_token_offered_as_a_query_parameter_opens_the_panel_for_a_browser() {
     let daemon = daemon(&root);
     let path = format!("/v1/summary?token={}", daemon.token());
 
-    // The scratch home has no editor database, so the work fails rather than the
-    // door. Anything but 401 proves the token was accepted.
+    // The panel reads the published record. A scratch directory has none, which
+    // is an empty answer, not a refusal and not a scan.
     let answer = daemon.answer(&request("GET", &path, None, ""));
 
-    assert_ne!(answer.status, 401);
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert!(answer.body.contains("\"days\":0"), "{}", answer.body);
 }
 
 #[test]
@@ -274,6 +275,112 @@ fn a_hostile_editor_name_cannot_arrive_by_saying_hello() {
 
     assert_eq!(answer.status, 400);
     assert!(presence::read(&root.join("state")).is_empty());
+}
+
+#[test]
+fn a_rebuild_is_the_collector_process_and_not_a_scan_in_this_one() {
+    let root = scratch("rebuild");
+    let script = root.join("collect.sh");
+    let recorded = root.join("args");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\necho \"4 days recorded as m-abc through {}\"\n",
+            recorded.display(),
+            root.join("record").display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+
+    let snapshot = root.join("record");
+    let sink: Box<dyn Sink + Send + Sync> = Box::new(FileSink {
+        path: snapshot.clone(),
+    });
+    let daemon = Daemon::with_collector(
+        Settings {
+            home: root.clone(),
+            state_dir: root.join("state"),
+            snapshot,
+            idle_timeout_seconds: 300,
+        },
+        sink,
+        script,
+        vec!["--no-push".to_owned()],
+    )
+    .expect("a daemon should start against a scratch directory");
+
+    let answer = daemon.answer(&request("POST", "/v1/collect", Some(daemon.token()), ""));
+
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert!(answer.body.contains("\"days\":4"), "{}", answer.body);
+    let args = fs::read_to_string(recorded).unwrap();
+    assert!(args.contains("--state\n"), "{args}");
+    assert!(args.contains("--home\n"), "{args}");
+    assert!(args.contains("--no-push\n"), "{args}");
+    assert!(!args.contains("--recount"), "{args}");
+}
+
+#[test]
+fn a_collector_that_fails_is_reported_rather_than_treated_as_a_record() {
+    let root = scratch("rebuild-fails");
+    let script = root.join("collect.sh");
+    fs::write(&script, "#!/bin/sh\necho 'index unreadable' >&2\nexit 1\n").unwrap();
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+
+    let snapshot = root.join("record");
+    let sink: Box<dyn Sink + Send + Sync> = Box::new(FileSink {
+        path: snapshot.clone(),
+    });
+    let daemon = Daemon::with_collector(
+        Settings {
+            home: root.clone(),
+            state_dir: root.join("state"),
+            snapshot,
+            idle_timeout_seconds: 300,
+        },
+        sink,
+        script,
+        Vec::new(),
+    )
+    .unwrap();
+
+    let answer = daemon.answer(&request("POST", "/v1/collect", Some(daemon.token()), ""));
+
+    assert_eq!(answer.status, 500, "{}", answer.body);
+    assert!(answer.body.contains("index unreadable"), "{}", answer.body);
+}
+
+#[test]
+fn a_timer_does_not_forward_a_recount() {
+    let args = [
+        "--sink",
+        "git",
+        "--recount",
+        "--no-push",
+        "--repo",
+        "/tmp/storage",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+
+    assert_eq!(
+        github_personal_stats_daemon::collector_overrides(&args),
+        vec![
+            "--sink".to_owned(),
+            "git".to_owned(),
+            "--repo".to_owned(),
+            "/tmp/storage".to_owned(),
+            "--no-push".to_owned(),
+        ]
+    );
 }
 
 #[test]

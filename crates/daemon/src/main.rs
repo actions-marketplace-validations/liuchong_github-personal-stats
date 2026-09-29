@@ -118,7 +118,12 @@ fn serve(args: &[String], settings: Settings, prefs: &Preferences) -> Result<(),
 
     let sink = sink_for(args, &settings, prefs)?;
     let publishing = sink.describe();
-    let daemon = Arc::new(Daemon::new(settings, sink)?);
+    let daemon = Arc::new(Daemon::with_collector(
+        settings,
+        sink,
+        github_personal_stats_daemon::collector_program(),
+        github_personal_stats_daemon::collector_overrides(args),
+    )?);
     let listener = daemon.listen(&address)?;
 
     println!(

@@ -444,3 +444,14 @@ directory, and the binaries for this machine are aarch64. The reader order is
 in `.agents/knowledge/collector-plan.md`. No product code changed, and the
 running daemon was left in place so a restart would not begin another
 in-process scan.
+
+## [2026-09-29] collector | scan in a process that exits
+
+The daemon's timer and `POST /v1/collect` now run `github-personal-stats-collect`
+and wait for it. The panel reads the published record, so opening it does not
+scan. Codex sessions are chosen from `state_*.sqlite`: a session whose
+`updated_at_ms` has not moved is replayed from `resume/codex` in the state
+directory, and a day is still the sum of every session. An index that does not
+have the expected table fails the run instead of falling back to a full walk.
+`cargo test` for the collector and the daemon passed, and clippy is clean on
+both.

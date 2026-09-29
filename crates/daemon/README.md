@@ -1,8 +1,8 @@
 # github-personal-stats-daemon
 
 The local half of activity collection. It listens for pulses from editor plugins,
-rebuilds the activity snapshot on a timer, and serves a panel showing what has
-been collected on this machine.
+and on a timer runs the collector as its own process so a scan's memory dies
+with that process. The panel shows the published record.
 
 It listens on the loopback address and refuses to start on any other, because it
 holds a machine's whole activity history and accepts writes. Nothing about it
